@@ -10,11 +10,11 @@ SCOPES     = ["https://www.googleapis.com/auth/spreadsheets"]
 ACTOR_ID   = "novi/advanced-search-tiktok-api"
 
 # --- ปรับค่า search ตรงนี้ ---
-TIKTOK_KEYWORD     = "viral"   # คำค้นหา
+TIKTOK_KEYWORD     = "ภาษี รถติด"   # คำค้นหา
 TIKTOK_LIMIT       = 50        # จำนวน video สูงสุด
 TIKTOK_REGION      = "TH"      # รหัสประเทศ เช่น TH, US, GB
 TIKTOK_SORT_TYPE   = 1         # 0=Relevance, 1=Most Liked, 2=Most Recent
-TIKTOK_PUBLISH_TIME = "WEEK"   # ALL_TIME, YESTERDAY, WEEK, MONTH, THREE_MONTH, SIX_MONTH
+TIKTOK_PUBLISH_TIME = "ALL_TIME"   # ALL_TIME, YESTERDAY, WEEK, MONTH, THREE_MONTH, SIX_MONTH
 
 # ---------- คอลัมน์ที่บันทึกลง Google Sheet ----------
 # เลือกเฉพาะ field ที่อยากเก็บจาก output ของ Actor
