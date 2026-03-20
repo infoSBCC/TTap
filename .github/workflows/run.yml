@@ -22,4 +22,5 @@ jobs:
       - name: Run script
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: python main.py
