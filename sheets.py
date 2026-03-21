@@ -88,5 +88,5 @@ def append_unique_posts(new_rows):
         if new_rows:
                     sheet.append_rows(new_rows, value_input_option="USER_ENTERED")
                     print(f"appended {len(new_rows)} rows to UniquePost")
-else:
-        print("no new rows to append")
+        else:
+            print("no new rows to append")
