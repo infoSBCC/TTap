@@ -66,8 +66,8 @@ def label_with_claude(description, keyword_description):
     )
     try:
         message = claude_client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=10,
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
         )
         answer = message.content[0].text.strip().lower()
