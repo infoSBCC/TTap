@@ -1,18 +1,41 @@
 # ===== main.py =====
 # STEP 1: Keyword Search  - loop Apify search actor per keyword
-# STEP 2: Unique Post     - filter dup -> Claude label (by description) -> transcript only "yes" -> append sheet
+# STEP 2: Unique Post     - filter dup -> Claude label -> append UniquePost sheet
+# STEP 5: Fetch Stats     - filter yes + after cutoff -> run stats actor -> append AllPost sheet
+# STEP 6: Delta Filter    - compare today vs yesterday comments -> pass tier threshold -> next step
 
 import os
 import json
-import time
 import datetime
 import anthropic
 from apify_client import ApifyClient
-from sheets import get_keywords, get_existing_links, append_unique_posts
+from sheets import (
+    get_keywords,
+    get_existing_links,
+    append_unique_posts,
+    get_yes_links_after_cutoff,
+    append_all_posts,
+    get_active_links_by_delta,
+    append_comments,
+    get_type_criteria,
+    get_issue_criteria,
+    get_instruction,
+    get_other_instruction,
+    get_unlabeled_comments,
+    get_other_issue_comments,
+    batch_update_type_and_issue,
+    batch_update_issue_only,
+    append_issue_criteria,
+)
 from config import (
     SEARCH_ACTOR_ID,
-    TRANSCRIPT_ACTOR_ID,
+    STATS_ACTOR_ID,
     TIKTOK_SORT_TYPE,
+    COMMENT_ACTOR_ID,
+    COMMENT_MAX_ITEMS,
+    OTHER_ISSUE_THRESHOLD,
+    OTHER_SAMPLE_SIZE,
+    CLASSIFY_BATCH_SIZE,
 )
 
 APIFY_TOKEN    = os.environ["APIFY_TOKEN"]
@@ -37,35 +60,17 @@ def search_tiktok(keyword, limit, time_range):
     return items
 
 
-def get_transcript_single(link):
-    run_input = {"startUrls": [{"url": link}]}
-    print(f"  [Transcript] fetching: {link}")
-    try:
-        run     = apify_client.actor(TRANSCRIPT_ACTOR_ID).call(run_input=run_input)
-        results = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
-        for item in results:
-            url        = str(item.get("tiktokUrl", item.get("url", ""))).strip()
-            transcript = str(item.get("transcript", "")).strip()
-            if url:
-                return transcript
-        return ""
-    except Exception as e:
-        print(f"  [warn] transcript error: {e}")
-        return ""
-
-
-def label_batch_with_claude(posts_to_label):
+def label_with_claude(posts_to_label):
     """
-    Label multiple posts in one Claude call.
+    Label a chunk of posts in one Claude call.
     posts_to_label: list of {"id": link, "description": str, "keyword_description": str}
-    Returns: dict {link: "yes" or "Non"}
+    Returns: dict {link: "yes" | "Non" | "fail"}
     """
     if not posts_to_label:
         return {}
 
-    # Build the batch prompt
     posts_text = ""
-    for i, post in enumerate(posts_to_label):
+    for post in posts_to_label:
         posts_text += (
             f"---\n"
             f"POST_ID: {post['id']}\n"
@@ -84,58 +89,233 @@ def label_batch_with_claude(posts_to_label):
         "No explanation. No markdown. Just the JSON array."
     )
 
-    MAX_RETRIES = 3
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            print(f"  [attempt {attempt}/{MAX_RETRIES}]")
-            message = claude_client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=4096,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = message.content[0].text.strip()
+    try:
+        print(f"  [Claude] labeling {len(posts_to_label)} posts...")
+        message = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
 
-            # Clean potential markdown fences
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3].strip()
+        results   = json.loads(raw)
+        label_map = {}
+        for item in results:
+            post_id = item.get("id", "")
+            label   = item.get("label", "Non")
+            label_map[post_id] = "yes" if "yes" in label.lower() else "Non"
 
-            results   = json.loads(raw)
-            label_map = {}
-            for item in results:
-                post_id = item.get("id", "")
-                label   = item.get("label", "Non")
-                label_map[post_id] = "yes" if "yes" in label.lower() else "Non"
+        # Posts missing from Claude response → fail
+        for p in posts_to_label:
+            if p["id"] not in label_map:
+                label_map[p["id"]] = "fail"
 
-            # Verify all posts got a label, retry if some are missing
-            missing = [p["id"] for p in posts_to_label if p["id"] not in label_map]
-            if missing:
-                print(f"  [warn] {len(missing)} posts missing from response")
-                if attempt < MAX_RETRIES:
-                    print(f"  retrying in 5s...")
-                    time.sleep(5)
-                    continue
-                # Last attempt: fill missing as Non
-                for pid in missing:
-                    label_map[pid] = "Non"
+        return label_map
 
-            return label_map
+    except Exception as e:
+        print(f"  [warn] labeling failed: {e} — marking all as fail")
+        return {post["id"]: "fail" for post in posts_to_label}
 
-        except Exception as e:
-            print(f"  [warn] attempt {attempt} failed: {e}")
-            if attempt < MAX_RETRIES:
-                wait = 5 * attempt  # 5s, 10s
-                print(f"  retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"  [error] all {MAX_RETRIES} attempts failed, labeling batch as Non")
-                return {post["id"]: "Non" for post in posts_to_label}
+
+def fetch_stats(links):
+    """
+    Run the stats actor for a list of TikTok links.
+    Returns: dict {postPage: {"likes": int, "comments": int, "shares": int, "bookmarks": int}}
+    """
+    run_input = {
+        "customMapFunction":    "(object) => { return {...object} }",
+        "dateRange":            "DEFAULT",
+        "includeSearchKeywords": False,
+        "location":             "US",
+        "maxItems":             1000,
+        "sortType":             "RELEVANCE",
+        "startUrls":            [{"url": lnk} for lnk in links],
+    }
+    print(f"  [Stats] running actor for {len(links)} links...")
+    run     = apify_client.actor(STATS_ACTOR_ID).call(run_input=run_input)
+    items   = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
+    print(f"    got {len(items)} results")
+
+    stats_map = {}
+    for item in items:
+        link = str(item.get("postPage", "")).strip()
+        if link:
+            stats_map[link] = {
+                "likes":     int(item.get("likes",      0)),
+                "comments":  int(item.get("comments",   0)),
+                "shares":    int(item.get("shares",     0)),
+                "bookmarks": int(item.get("bookmarks",  0)),
+            }
+    return stats_map
+
+
+
+def fetch_comments(links, scrape_date):
+    """
+    Run xtdata/tiktok-comment-scraper สำหรับ links ที่ผ่าน delta filter
+    Returns: list of rows สำหรับ append ไป Comments sheet
+    """
+    run_input = {
+        "maxItems":           COMMENT_MAX_ITEMS,
+        "shouldScrapeAll":    False,
+        "shouldScrapeReplies": False,
+        "urls":               links,
+    }
+    print(f"  [Comments] running actor for {len(links)} links...")
+    run   = apify_client.actor(COMMENT_ACTOR_ID).call(run_input=run_input)
+    items = list(apify_client.dataset(run["defaultDatasetId"]).iterate_items())
+    print(f"    got {len(items)} comments")
+
+    # สร้าง map: aweme_id → original link (เพื่อใช้เป็น key join)
+    aweme_to_link = {}
+    for lnk in links:
+        # extract video id จาก url เช่น .../video/7211250685902359850...
+        parts = lnk.split("/video/")
+        if len(parts) == 2:
+            vid_id = parts[1].split("?")[0].strip()
+            aweme_to_link[vid_id] = lnk
+
+    rows = []
+    for item in items:
+        aweme_id = str(item.get("aweme_id", "")).strip()
+        video_link = aweme_to_link.get(aweme_id, aweme_id)  # fallback เป็น id ถ้าหา link ไม่เจอ
+
+        rows.append([
+            video_link,
+            str(item.get("cid", "")).strip(),
+            str(item.get("text", "")).strip(),
+            item.get("create_time", ""),
+            int(item.get("digg_count", 0) or 0),
+            int(item.get("reply_comment_total", 0) or 0),
+            str(item.get("user/uid", "")).strip(),
+            str(item.get("user/unique_id", "")).strip(),
+            str(item.get("user/nickname", "")).strip(),
+            int(item.get("user/follower_count", 0) or 0),
+            str(item.get("user/region", "")).strip(),
+            scrape_date,
+        ])
+    return rows
+
+
+
+def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
+    """
+    Phase 1: จัดประเภท TypeLabel + IssueLabels สำหรับ 1 batch (max 100)
+    Returns: list of {"cid": str, "type_label": str, "issue_labels": str}
+    """
+    type_block  = "\n".join(
+        f'{t["name"]}: {t["criteria"]}' for t in type_criteria
+    ) + "\nOther: ความคิดเห็นที่ไม่ตรงกับประเภทใดข้างต้น"
+
+    issue_block = "\n".join(
+        f'{i["name"]}: {i["criteria"]}' for i in issue_criteria
+    ) + "\nOther: ประเด็นที่ไม่ตรงกับรายการใดข้างต้น"
+
+    comments_block = ""
+    for c in batch:
+        comments_block += f"---\nID: {c['cid']}\nTEXT: {c['text']}\n"
+    comments_block += "---"
+
+    prompt = (
+        f"{instruction}\n\n"
+        f"=== ประเภทความคิดเห็น (TypeCriteria) ===\n{type_block}\n\n"
+        f"=== ประเด็น (IssueCriteria) ===\n{issue_block}\n\n"
+        f"=== ความคิดเห็นที่ต้องจัดประเภท ===\n{comments_block}\n\n"
+        "ตอบเป็น JSON array เท่านั้น รูปแบบ:\n"
+        '[{"id":"...", "type":"...", "issues":["..."]}]\n'
+        "ถ้าไม่มี issue ที่ตรง ให้ issues = [\"Other\"]\n"
+        "ห้ามอธิบายเพิ่มเติม ห้ามใส่ markdown"
+    )
+
+    try:
+        message = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
+
+        results = json.loads(raw)
+        output  = []
+        for item in results:
+            issues_list = item.get("issues", ["Other"])
+            if not issues_list:
+                issues_list = ["Other"]
+            output.append({
+                "cid":          str(item.get("id", "")),
+                "type_label":   str(item.get("type", "Other")),
+                "issue_labels": "|".join(issues_list),
+            })
+        return output
+
+    except Exception as e:
+        print(f"  [warn] classify batch failed: {e} — marking as Other")
+        return [{"cid": c["cid"], "type_label": "Other", "issue_labels": "Other"}
+                for c in batch]
+
+
+def detect_other_issues(other_comments, issue_criteria, other_instruction):
+    """
+    Phase 2: วิเคราะห์ IssueLabels=Other → หาประเด็นใหม่ไม่เกิน 2 ประเด็น
+    other_comments: list of {"row_index", "cid", "text"}
+    Returns: (new_issues, mapping)
+      new_issues: list of {"name": str, "criteria": str}
+      mapping:    dict {cid: "issue_name or Other"}
+    """
+    import random
+    sample = other_comments
+    if len(other_comments) > OTHER_SAMPLE_SIZE:
+        sample = random.sample(other_comments, OTHER_SAMPLE_SIZE)
+        print(f"  sampled {OTHER_SAMPLE_SIZE} from {len(other_comments)} Other comments")
+
+    issue_block = "\n".join(
+        f'{i["name"]}: {i["criteria"]}' for i in issue_criteria
+    )
+    comments_block = ""
+    for c in sample:
+        comments_block += f"---\nID: {c['cid']}\nTEXT: {c['text']}\n"
+    comments_block += "---"
+
+    prompt = (
+        f"{other_instruction}\n\n"
+        f"=== ประเด็นที่มีอยู่แล้ว ===\n{issue_block}\n\n"
+        f"=== ความคิดเห็น IssueLabels=Other ({len(sample)} รายการ) ===\n"
+        f"{comments_block}"
+    )
+
+    try:
+        message = claude_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
+
+        result    = json.loads(raw)
+        new_types = result.get("new_issues", [])
+        mapping   = {item["id"]: item.get("new_issue", "Other")
+                     for item in result.get("mapping", [])}
+        return new_types, mapping
+
+    except Exception as e:
+        print(f"  [warn] other detection failed: {e}")
+        return [], {}
 
 
 def main():
-    today = datetime.date.today().isoformat()
-
+    # ------------------------------------------------------------------ #
     print("=" * 50)
     print("STEP 1: Keyword Search")
     print("=" * 50)
@@ -168,6 +348,7 @@ def main():
     print(f"\ntotal links found: {len(all_found)}")
     print()
 
+    # ------------------------------------------------------------------ #
     print("=" * 50)
     print("STEP 2: Unique Post")
     print("=" * 50)
@@ -181,16 +362,17 @@ def main():
         print("no new links. done!")
         return
 
+    # ------------------------------------------------------------------ #
     print("=" * 50)
-    print("STEP 3: Claude Label (BATCH)")
+    print("STEP 3: Claude Label (batch 50, no retry)")
     print("=" * 50)
 
-    # Build batch input (skip posts with no description)
     posts_to_label = []
-    no_desc_links  = []
+    label_map      = {}
     for link, meta in new_links.items():
         if not meta["description"]:
-            no_desc_links.append(link)
+            label_map[link] = "Non"
+            print(f"  [skip] {link[:60]}... -> Non (no description)")
         else:
             posts_to_label.append({
                 "id":                  link,
@@ -198,48 +380,29 @@ def main():
                 "keyword_description": meta["kw_info"]["description"],
             })
 
-    # Batch call — split into chunks of 50 to stay within token limits
     BATCH_SIZE = 50
-    label_map  = {}
-
-    # No-description posts default to Non
-    for link in no_desc_links:
-        label_map[link] = "Non"
-        print(f"  [Label] {link} -> Non (no description)")
-
     for i in range(0, len(posts_to_label), BATCH_SIZE):
         chunk = posts_to_label[i : i + BATCH_SIZE]
-        print(f"  [Batch] labeling posts {i+1}-{i+len(chunk)} / {len(posts_to_label)}")
-        chunk_labels = label_batch_with_claude(chunk)
+        print(f"  [Batch] posts {i+1}-{i+len(chunk)} / {len(posts_to_label)}")
+        chunk_labels = label_with_claude(chunk)
         label_map.update(chunk_labels)
         for post in chunk:
             lbl = chunk_labels.get(post["id"], "Non")
             print(f"    {post['id'][:60]}... -> {lbl}")
 
-    yes_links = [link for link, lbl in label_map.items() if lbl == "yes"]
-    print(f"\n'yes' links: {len(yes_links)} / {len(new_links)}")
+    yes_count = sum(1 for lbl in label_map.values() if lbl == "yes")
+    print(f"\n'yes' posts: {yes_count} / {len(new_links)}")
     print()
 
+    # ------------------------------------------------------------------ #
     print("=" * 50)
-    print("STEP 4: Fetch Transcript (yes only, one by one)")
-    print("=" * 50)
-
-    transcript_map = {}
-    for link in yes_links:
-        transcript = get_transcript_single(link)
-        transcript_map[link] = transcript
-    print(f"transcripts fetched: {len(transcript_map)}")  # ✅ FIX: ย้ายออกนอก for loop
-    print()
-
-    print("=" * 50)
-    print("STEP 5: Build Rows & Append")
+    print("STEP 4: Append to UniquePost")
     print("=" * 50)
 
     rows = []
     for link, meta in new_links.items():
-        use_label  = label_map.get(link, "Non")
-        transcript = transcript_map.get(link, "")
-        kw_info    = meta["kw_info"]
+        use_label = label_map.get(link, "Non")
+        kw_info   = meta["kw_info"]
         rows.append([
             meta["create_time"],
             link,
@@ -247,7 +410,7 @@ def main():
             meta["author_unique_id"],
             meta["author_follower"],
             meta["description"],
-            transcript,
+            "",              # Transcription — ไม่ได้ดึง ปล่อยว่าง
             meta["video_duration"],
             meta["music_title"],
             use_label,
@@ -256,6 +419,141 @@ def main():
 
     print(f"appending {len(rows)} rows to UniquePost...")
     append_unique_posts(rows)
+    print()
+
+    # ------------------------------------------------------------------ #
+    print("=" * 50)
+    print("STEP 5: Fetch Stats → AllPost")
+    print("=" * 50)
+
+    # ดึง link ที่ Use="yes" และ PublishDate > cutoff จาก UniquePost ทั้งหมด
+    yes_links = get_yes_links_after_cutoff()
+
+    if not yes_links:
+        print("no qualifying links for stats. done!")
+        return
+
+    # Run stats actor (ส่งทีเดียวทั้งหมด)
+    scrape_date = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    stats_map   = fetch_stats(yes_links)
+
+    # Build rows สำหรับ AllPost: [Link, Like, Comment, Share, Save, ScrapeDate]
+    all_post_rows = []
+    for link in yes_links:
+        s = stats_map.get(link, {})
+        all_post_rows.append([
+            link,
+            s.get("likes",     0),
+            s.get("comments",  0),
+            s.get("shares",    0),
+            s.get("bookmarks", 0),
+            scrape_date,
+        ])
+
+    print(f"appending {len(all_post_rows)} rows to AllPost...")
+    append_all_posts(all_post_rows)
+    print("done!")
+
+
+    # ------------------------------------------------------------------ #
+    print("=" * 50)
+    print("STEP 6: Delta Filter → active links")
+    print("=" * 50)
+
+    active_links = get_active_links_by_delta()
+
+    if not active_links:
+        print("no links passed delta filter. done!")
+        return
+
+
+    print(f"\n{len(active_links)} link(s) passed — proceeding to comment scrape.")
+    print()
+
+    # ------------------------------------------------------------------ #
+    print("=" * 50)
+    print("STEP 7: Scrape Comments → Comments sheet")
+    print("=" * 50)
+
+    scrape_date   = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    comment_rows  = fetch_comments(active_links, scrape_date)
+
+    print(f"appending {len(comment_rows)} comment rows to Comments sheet...")
+    append_comments(comment_rows)
+    print("done!")
+
+
+
+    # ------------------------------------------------------------------ #
+    print("=" * 50)
+    print("STEP 8: Classify Comments (Phase 1)")
+    print("=" * 50)
+
+    type_criteria     = get_type_criteria()
+    issue_criteria    = get_issue_criteria()
+    instruction       = get_instruction()
+    unlabeled         = get_unlabeled_comments()
+
+    print(f"  types: {len(type_criteria)}  issues: {len(issue_criteria)}")
+
+    # build cid → row_index map สำหรับ update กลับ
+    cid_to_row = {c["cid"]: c["row_index"] for c in unlabeled}
+
+    label_updates = []
+    for i in range(0, len(unlabeled), CLASSIFY_BATCH_SIZE):
+        chunk = unlabeled[i : i + CLASSIFY_BATCH_SIZE]
+        print(f"  [Batch] comments {i+1}-{i+len(chunk)} / {len(unlabeled)}")
+        results = classify_comments_batch(chunk, type_criteria, issue_criteria, instruction)
+        for r in results:
+            row = cid_to_row.get(r["cid"])
+            if row:
+                label_updates.append({
+                    "row_index":    row,
+                    "type_label":   r["type_label"],
+                    "issue_labels": r["issue_labels"],
+                })
+
+    batch_update_type_and_issue(label_updates)
+    print(f"  classified {len(label_updates)} comment(s)")
+    print()
+
+    # ------------------------------------------------------------------ #
+    print("=" * 50)
+    print("STEP 9: Other Issue Detection (Phase 2)")
+    print("=" * 50)
+
+    other_comments = get_other_issue_comments()
+
+    if len(other_comments) <= OTHER_ISSUE_THRESHOLD:
+        print(f"  Other ({len(other_comments)}) ≤ {OTHER_ISSUE_THRESHOLD} — skip phase 2. done!")
+        return
+
+    print(f"  Other ({len(other_comments)}) > {OTHER_ISSUE_THRESHOLD} — running detection...")
+    other_instruction = get_other_instruction()
+    new_issues, mapping = detect_other_issues(other_comments, issue_criteria, other_instruction)
+
+    if not new_issues:
+        print("  no new issues found. done!")
+        return
+
+    print(f"  new issues: {[n['name'] for n in new_issues]}")
+
+    # อัปเดต IssueLabels ของ comment ที่ถูก map ไปประเด็นใหม่
+    issue_updates = []
+    cid_to_row_other = {c["cid"]: c["row_index"] for c in other_comments}
+    for cid, new_issue in mapping.items():
+        row = cid_to_row_other.get(cid)
+        if row and new_issue != "Other":
+            issue_updates.append({
+                "row_index":    row,
+                "issue_labels": new_issue,
+            })
+
+    batch_update_issue_only(issue_updates)
+    print(f"  updated {len(issue_updates)} comment(s) with new issues")
+
+    # append ประเด็นใหม่ไปที่ IssueCriteria sheet
+    append_issue_criteria(new_issues)
     print("done!")
 
 
