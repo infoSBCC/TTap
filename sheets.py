@@ -13,6 +13,7 @@ from config import (
     KEYWORD_GROUP_COL,
     KEYWORD_DESC_COL,
     KEYWORD_SCRAPE_COL,
+    KEYWORD_TIME_COL,
     UNIQUE_POST_SHEET_ID,
     UNIQUE_POST_SHEET_NAME,
 )
@@ -56,12 +57,16 @@ def get_keywords():
                                     limit = int(limit_raw)
 except (ValueError, TypeError):
             limit = 100  # fallback ถ้าไม่มีค่าหรือค่าไม่ใช่ตัวเลข
+        time_range = str(row.get(KEYWORD_TIME_COL, "")).strip().upper()
+        if not time_range:
+                        time_range = "ALL_TIME"  # fallback ถ้า cell ว่าง
         if kw:
                         result.append({
                                             "keyword":     kw,
                                             "group":       grp,
                                             "description": desc,
                                             "limit":       limit,
+                                            "time_range":  time_range,
                         })
                 return result
 
