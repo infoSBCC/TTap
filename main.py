@@ -3,6 +3,8 @@
 # STEP 2: Unique Post - filter dup -> Claude label (by description) -> transcript only "yes" -> append sheet
 
 import os
+import json
+import time
 import datetime
 import anthropic
 from apify_client import ApifyClient
@@ -54,30 +56,83 @@ def get_transcript_single(link):
         return ""
 
 
-def label_with_claude(description, keyword_description):
-    if not description or not keyword_description:
-        return "Non"
-    prompt = (
-        f"You are a content relevance classifier.\n\n"
-        f"Keyword Description:\n{keyword_description}\n\n"
-        f"TikTok Video Description:\n{description}\n\n"
-        f"Is this video description relevant to the keyword description above?\n"
-        f"Reply with ONLY one word: 'yes' if relevant, 'Non' if not relevant."
-    )
-    try:
-        message = claude_client.messages.create(
-            model="claude-sonnet-4-5-20250929",
-            max_tokens=1000,
-            messages=[{"role": "user", "content": prompt}],
+def label_batch_with_claude(posts_to_label):
+    """
+    Label multiple posts in one Claude call.
+    posts_to_label: list of {"id": link, "description": str, "keyword_description": str}
+    Returns: dict {link: "yes" or "Non"}
+    """
+    if not posts_to_label:
+        return {}
+
+    # Build the batch prompt
+    posts_text = ""
+    for i, post in enumerate(posts_to_label):
+        posts_text += (
+            f"---\n"
+            f"POST_ID: {post['id']}\n"
+            f"KEYWORD_DESCRIPTION: {post['keyword_description']}\n"
+            f"VIDEO_DESCRIPTION: {post['description']}\n"
         )
-        answer = message.content[0].text.strip().lower()
-        if "yes" in answer:
-            return "yes"
-        else:
-            return "Non"
-    except Exception as e:
-        print(f"  [warn] Claude label error: {e}")
-        return "Non"
+    posts_text += "---\n"
+
+    prompt = (
+        "You are a content relevance classifier.\n\n"
+        "Below is a list of TikTok posts. For each post, decide if the VIDEO_DESCRIPTION "
+        "is relevant to its KEYWORD_DESCRIPTION.\n\n"
+        f"{posts_text}\n"
+        "Reply ONLY with a valid JSON array. Each element must be:\n"
+        '{"id": "<POST_ID>", "label": "yes" or "Non"}\n\n'
+        "No explanation. No markdown. Just the JSON array."
+    )
+
+    MAX_RETRIES = 3
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"    [attempt {attempt}/{MAX_RETRIES}]")
+            message = claude_client.messages.create(
+                model="claude-sonnet-4-5-20250929",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text.strip()
+
+            # Clean potential markdown fences
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3].strip()
+
+            results = json.loads(raw)
+            label_map = {}
+            for item in results:
+                post_id = item.get("id", "")
+                label = item.get("label", "Non")
+                label_map[post_id] = "yes" if "yes" in label.lower() else "Non"
+
+            # Verify all posts got a label, retry if some are missing
+            missing = [p["id"] for p in posts_to_label if p["id"] not in label_map]
+            if missing:
+                print(f"    [warn] {len(missing)} posts missing from response")
+                if attempt < MAX_RETRIES:
+                    print(f"    retrying in 5s...")
+                    time.sleep(5)
+                    continue
+                # Last attempt: fill missing as Non
+                for pid in missing:
+                    label_map[pid] = "Non"
+
+            return label_map
+
+        except Exception as e:
+            print(f"    [warn] attempt {attempt} failed: {e}")
+            if attempt < MAX_RETRIES:
+                wait = 5 * attempt  # 5s, 10s
+                print(f"    retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"    [error] all {MAX_RETRIES} attempts failed, labeling batch as Non")
+                return {post["id"]: "Non" for post in posts_to_label}
 
 
 def main():
@@ -101,7 +156,9 @@ def main():
                     "kw_info": kw_info,
                     "create_time": str(item.get("create_time", "")).strip(),
                     "author_name": str(author.get("nickname", "")).strip(),
-                    "author_unique_id": str(author.get("search_user_desc", author.get("uniqueId", ""))).strip(),
+                    "author_unique_id": str(
+                        author.get("search_user_desc", author.get("uniqueId", ""))
+                    ).strip(),
                     "author_follower": str(author.get("follower_count", "")).strip(),
                     "description": str(item.get("desc", "")).strip(),
                     "video_duration": str(video.get("duration", "")).strip(),
@@ -124,24 +181,41 @@ def main():
         return
 
     print("=" * 50)
-    print("STEP 3: Claude Label (by Description)")
+    print("STEP 3: Claude Label (BATCH)")
     print("=" * 50)
-    yes_links = []
-    label_map = {}
-    for link, meta in new_links.items():
-        description = meta["description"]
-        kw_info = meta["kw_info"]
-        print(f"  [Label] {link}")
-        if not description:
-            print("    no description -> label Non")
-            use_label = "Non"
-        else:
-            use_label = label_with_claude(description, kw_info["description"])
-            print(f"    Claude label -> {use_label}")
-        label_map[link] = use_label
-        if use_label == "yes":
-            yes_links.append(link)
 
+    # Build batch input (skip posts with no description)
+    posts_to_label = []
+    no_desc_links = []
+    for link, meta in new_links.items():
+        if not meta["description"]:
+            no_desc_links.append(link)
+        else:
+            posts_to_label.append({
+                "id": link,
+                "description": meta["description"],
+                "keyword_description": meta["kw_info"]["description"],
+            })
+
+    # Batch call — split into chunks of 50 to stay within token limits
+    BATCH_SIZE = 50
+    label_map = {}
+
+    # No-description posts default to Non
+    for link in no_desc_links:
+        label_map[link] = "Non"
+        print(f"  [Label] {link} -> Non (no description)")
+
+    for i in range(0, len(posts_to_label), BATCH_SIZE):
+        chunk = posts_to_label[i : i + BATCH_SIZE]
+        print(f"  [Batch] labeling posts {i+1}-{i+len(chunk)} / {len(posts_to_label)}")
+        chunk_labels = label_batch_with_claude(chunk)
+        label_map.update(chunk_labels)
+        for post in chunk:
+            lbl = chunk_labels.get(post["id"], "Non")
+            print(f"    {post['id'][:60]}... -> {lbl}")
+
+    yes_links = [link for link, lbl in label_map.items() if lbl == "yes"]
     print(f"\n'yes' links: {len(yes_links)} / {len(new_links)}")
     print()
 
@@ -160,7 +234,7 @@ def main():
     print("=" * 50)
     rows = []
     for link, meta in new_links.items():
-        use_label = label_map[link]
+        use_label = label_map.get(link, "Non")
         transcript = transcript_map.get(link, "")
         kw_info = meta["kw_info"]
         rows.append([
