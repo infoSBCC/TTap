@@ -28,7 +28,7 @@ STATS_ACTOR_ID  = "apidojo/tiktok-scraper"   # ใส่ actor ID สำหร�
 TIKTOK_SORT_TYPE = 0  # 0=Relevance, 1=Most Liked, 2=Most Recent
 
 # ---------- Filter Config ----------
-PUBLISH_DATE_CUTOFF = 1735689600  # Jan 1, 2025 00:00:00 UTC (= หลัง 31 Dec 2024)
+PUBLISH_DATE_CUTOFF = 1704067200  # Jan 1, 2024 00:00:00 UTC (= หลัง 31 Dec 2023)
 
 # Sheet 4: Comments Sheet
 COMMENTS_SHEET_ID   = "1eyN3iREZD068lBSgZy1OzrCILxVlSKio_EJHF2AhnF0"  # ใส่ Sheet ID ที่ถูกต้อง
