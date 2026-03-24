@@ -39,6 +39,7 @@ def _normalize_link(url):
 UNIQUE_POST_HEADERS = [
     "PublishDate",
     "Link",
+    "PostID",
     "AuthorName",
     "AuthorUniqueID",
     "AuthorFollower",
@@ -53,6 +54,7 @@ UNIQUE_POST_HEADERS = [
 # AllPost sheet header columns (must match Google Sheet exactly)
 ALL_POST_HEADERS = [
     "Link",
+    "PostID",
     "Like",
     "Comment",
     "Share",
@@ -117,21 +119,22 @@ def get_existing_links():
 
 def get_yes_links_after_cutoff():
     """
-    ดึง Link จาก UniquePost ที่ Use = "yes" และ PublishDate > PUBLISH_DATE_CUTOFF
-    Returns: list of link strings
+    ดึง Link + PostID จาก UniquePost ที่ Use = "yes" และ PublishDate > PUBLISH_DATE_CUTOFF
+    Returns: list of {"link": str, "post_id": str}
     """
     sheet = get_sheet(UNIQUE_POST_SHEET_ID, UNIQUE_POST_SHEET_NAME)
     records = sheet.get_all_records()
     result = []
     for row in records:
-        use  = str(row.get("Use", "")).strip().lower()
-        link = _normalize_link(row.get("Link", ""))
+        use     = str(row.get("Use", "")).strip().lower()
+        link    = _normalize_link(row.get("Link", ""))
+        post_id = str(row.get("PostID", "")).strip()
         try:
             publish_ts = int(row.get("PublishDate", 0))
         except (ValueError, TypeError):
             publish_ts = 0
         if use == "yes" and link and publish_ts > PUBLISH_DATE_CUTOFF:
-            result.append(link)
+            result.append({"link": link, "post_id": post_id})
     print(f"  found {len(result)} yes-links after cutoff")
     return result
 
@@ -193,8 +196,10 @@ def get_active_links_by_delta():
     today_map     = {}   # link → comment count (วันนี้)
     yesterday_map = {}   # link → comment count (เมื่อวาน)
 
+    postid_map = {}  # link → post_id (อ่านจาก AllPost)
     for row in records:
         link        = _normalize_link(row.get("Link", ""))
+        post_id     = str(row.get("PostID", "")).strip()
         scrape_raw  = str(row.get("ScrapeDate", "")).strip()   # "2026-03-23 06:54:59 UTC"
         try:
             comments = int(row.get("Comment", 0))
@@ -203,6 +208,9 @@ def get_active_links_by_delta():
 
         if not link or not scrape_raw:
             continue
+
+        if post_id:
+            postid_map[link] = post_id
 
         scrape_date = scrape_raw[:10]   # ตัดเอาแค่ "YYYY-MM-DD"
 
@@ -231,7 +239,7 @@ def get_active_links_by_delta():
             passes = delta > 20
 
         if passes:
-            active_links.append(link)
+            active_links.append({"link": link, "post_id": postid_map.get(link, "")})
             print(f"  [delta] {link[:60]}... comments={comments_today}  delta={delta}  -> pass")
         else:
             print(f"  [delta] {link[:60]}... comments={comments_today}  delta={delta}  -> skip")
@@ -242,7 +250,7 @@ def get_active_links_by_delta():
 
 # Comments sheet header columns (must match Google Sheet exactly)
 COMMENTS_HEADERS = [
-    "VideoLink",         # key สำหรับ join กับ AllPost / UniquePost
+    "PostID",            # aweme_id — key สำหรับ join กับ AllPost / UniquePost
     "CommentID",
     "CommentText",
     "CommentDate",       # unix timestamp ของ comment
