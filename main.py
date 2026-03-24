@@ -244,7 +244,7 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
 
     try:
         message = claude_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="claude-sonnet-4-5-20250929",
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -304,7 +304,7 @@ def detect_other_issues(other_comments, issue_criteria, other_instruction):
 
     try:
         message = claude_client.messages.create(
-            model="claude-sonnet-4-6",
+            model="claude-sonnet-4-5-20250929",
             max_tokens=8096,
             messages=[{"role": "user", "content": prompt}],
         )
