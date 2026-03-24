@@ -95,23 +95,28 @@ def label_with_claude(posts_to_label):
     if not posts_to_label:
         return {}
 
+    # ใช้ index แทน URL เป็น id ใน prompt เพราะ URL ยาวเกินไป Gemini อาจ return ไม่ตรง
+    idx_to_link = {str(i): post["id"] for i, post in enumerate(posts_to_label)}
+
     posts_text = ""
-    for post in posts_to_label:
+    for i, post in enumerate(posts_to_label):
+        safe_desc = post["description"].replace('"', "'").replace("\n", " ")
+        safe_kw   = post["keyword_description"].replace('"', "'").replace("\n", " ")
         posts_text += (
             f"---\n"
-            f"POST_ID: {post['id']}\n"
-            f"KEYWORD_DESCRIPTION: {post['keyword_description']}\n"
-            f"VIDEO_DESCRIPTION: {post['description']}\n"
+            f"IDX: {i}\n"
+            f"KEYWORD: {safe_kw}\n"
+            f"VIDEO: {safe_desc}\n"
         )
     posts_text += "---\n"
 
     prompt = (
         "You are a content relevance classifier.\n\n"
-        "Below is a list of TikTok posts. For each post, decide if the VIDEO_DESCRIPTION "
-        "is relevant to its KEYWORD_DESCRIPTION.\n\n"
+        "Below is a list of TikTok posts. For each post, decide if the VIDEO description "
+        "is relevant to its KEYWORD.\n\n"
         f"{posts_text}\n"
         "Reply ONLY with a valid JSON array. Each element must be:\n"
-        '{"id": "<POST_ID>", "label": "yes" or "Non"}\n\n'
+        '{"idx": <number>, "label": "yes" or "Non"}\n\n'
         "No explanation. No markdown. Just the JSON array."
     )
 
@@ -122,13 +127,20 @@ def label_with_claude(posts_to_label):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
         if raw.endswith("```"):
             raw = raw[:-3].strip()
+        # extract JSON array
+        start = raw.find("[")
+        end   = raw.rfind("]")
+        if start != -1 and end != -1:
+            raw = raw[start:end+1]
 
         results   = json.loads(raw)
         label_map = {}
         for item in results:
-            post_id = item.get("id", "")
-            label   = item.get("label", "Non")
-            label_map[post_id] = "yes" if "yes" in label.lower() else "Non"
+            idx   = str(item.get("idx", ""))
+            label = item.get("label", "Non")
+            link  = idx_to_link.get(idx)
+            if link:
+                label_map[link] = "yes" if "yes" in label.lower() else "Non"
 
         # Posts missing from response → fail
         for p in posts_to_label:
