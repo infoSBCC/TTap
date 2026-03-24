@@ -194,7 +194,7 @@ def get_active_links_by_delta():
     yesterday_map = {}   # link → comment count (เมื่อวาน)
 
     for row in records:
-        link        = str(row.get("Link", "")).strip()
+        link        = _normalize_link(row.get("Link", ""))
         scrape_raw  = str(row.get("ScrapeDate", "")).strip()   # "2026-03-23 06:54:59 UTC"
         try:
             comments = int(row.get("Comment", 0))
@@ -215,9 +215,11 @@ def get_active_links_by_delta():
     active_links = []
     for link, comments_today in today_map.items():
         if link not in yesterday_map:
-            continue   # ไม่มีข้อมูลเมื่อวาน → ข้ามไป
-
-        delta = comments_today - yesterday_map[link]
+            # ยังไม่มีข้อมูลเมื่อวาน (เช่น run ครั้งแรก) → ใช้ comments_today เป็น delta แทน
+            print(f"  [delta] {link[:60]}... no yesterday data → use today as delta")
+            delta = comments_today
+        else:
+            delta = comments_today - yesterday_map[link]
 
         if comments_today >= 10_000:
             passes = delta > 1_000
