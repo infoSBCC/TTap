@@ -215,15 +215,15 @@ def fetch_comments(links, scrape_date):
 
     rows = []
     for item in items:
-        # aweme_id อาจเป็น int หรือ string → แปลงให้เป็น string เสมอก่อน lookup
-        aweme_id   = str(item.get("aweme_id", "")).strip()
-        video_link = aweme_to_link.get(aweme_id, "")
+        # aweme_id = PostID — ใช้เป็น key join กับ UniquePost / AllPost
+        aweme_id = str(item.get("aweme_id", "")).strip()
+        post_id  = aweme_id  # aweme_id คือ PostID เดียวกัน
 
         # user fields เป็น nested dict: item["user"]["uid"]
         user = item.get("user", {}) or {}
 
         rows.append([
-            video_link,
+            post_id,
             str(item.get("cid", "")).strip(),
             str(item.get("text", "")).strip(),
             item.get("create_time", ""),
@@ -368,8 +368,12 @@ def main():
                 author = item.get("author", {})
                 video  = item.get("video", {})
                 music  = item.get("added_sound_music_info", item.get("music", {}))
-                all_found[link] = {
+                # extract post_id จาก id field หรือจาก URL เป็น fallback
+                raw_id  = str(item.get("id", "")).strip()
+                post_id = raw_id if raw_id else link.split("/video/")[-1].split("?")[0]
+                all_found[normalize_link(link)] = {
                     "kw_info":          kw_info,
+                    "post_id":          post_id,
                     "create_time":      str(item.get("create_time", "")).strip(),
                     "author_name":      str(author.get("nickname", "")).strip(),
                     "author_unique_id": str(
@@ -442,6 +446,7 @@ def main():
         rows.append([
             meta["create_time"],
             link,
+            meta["post_id"],
             meta["author_name"],
             meta["author_unique_id"],
             meta["author_follower"],
@@ -462,23 +467,27 @@ def main():
     print("STEP 5: Fetch Stats → AllPost")
     print("=" * 50)
 
-    # ดึง link ที่ Use="yes" และ PublishDate > cutoff จาก UniquePost ทั้งหมด
-    yes_links = get_yes_links_after_cutoff()
+    # ดึง link + post_id ที่ Use="yes" และ PublishDate > cutoff จาก UniquePost ทั้งหมด
+    yes_links_data = get_yes_links_after_cutoff()
 
-    if not yes_links:
+    if not yes_links_data:
         print("no qualifying links for stats. done!")
         return
+
+    yes_links      = [d["link"]    for d in yes_links_data]
+    link_to_postid = {d["link"]: d["post_id"] for d in yes_links_data}
 
     # Run stats actor (ส่งทีเดียวทั้งหมด)
     scrape_date = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     stats_map   = fetch_stats(yes_links)
 
-    # Build rows สำหรับ AllPost: [Link, Like, Comment, Share, Save, ScrapeDate]
+    # Build rows สำหรับ AllPost: [Link, PostID, Like, Comment, Share, Save, ScrapeDate]
     all_post_rows = []
     for link in yes_links:
         s = stats_map.get(link, {})
         all_post_rows.append([
             link,
+            link_to_postid.get(link, ""),
             s.get("likes",     0),
             s.get("comments",  0),
             s.get("shares",    0),
@@ -496,14 +505,13 @@ def main():
     print("STEP 6: Delta Filter → active links")
     print("=" * 50)
 
-    active_links = get_active_links_by_delta()
+    active_links_data = get_active_links_by_delta()
 
-    if not active_links:
+    if not active_links_data:
         print("no links passed delta filter. done!")
         return
 
-
-    print(f"\n{len(active_links)} link(s) passed — proceeding to comment scrape.")
+    print(f"\n{len(active_links_data)} link(s) passed — proceeding to comment scrape.")
     print()
 
     # ------------------------------------------------------------------ #
@@ -511,6 +519,7 @@ def main():
     print("STEP 7: Scrape Comments → Comments sheet")
     print("=" * 50)
 
+    active_links  = [d["link"] for d in active_links_data]
     scrape_date   = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     comment_rows  = fetch_comments(active_links, scrape_date)
 
