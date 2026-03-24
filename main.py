@@ -4,7 +4,7 @@
 # STEP 5: Fetch Stats     - filter yes + after cutoff -> run stats actor -> append AllPost sheet
 # STEP 6: Delta Filter    - compare today vs yesterday comments -> pass tier threshold -> next step
 
-import osh
+import os
 import json
 import datetime
 from google import genai
@@ -59,7 +59,7 @@ def _gemini_call(prompt, thinking=False):
             max_output_tokens=8192,
         )
     response = gemini_client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-3-flash-preview",
         contents=prompt,
         config=cfg,
     )
@@ -294,7 +294,7 @@ def detect_other_issues(other_comments, issue_criteria, other_instruction):
     """
     import random
     sample = other_comments
-    if len(other_comments) > OTHER_SAMPLE_SIZE:h
+    if len(other_comments) > OTHER_SAMPLE_SIZE:
         sample = random.sample(other_comments, OTHER_SAMPLE_SIZE)
         print(f"  sampled {OTHER_SAMPLE_SIZE} from {len(other_comments)} Other comments")
 
