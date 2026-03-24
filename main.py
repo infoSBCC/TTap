@@ -47,23 +47,41 @@ gemini_client = genai.Client(api_key=GEMINI_API)
 
 
 
-def _gemini_call(prompt, thinking=False):
+def _gemini_call(prompt, thinking=False, max_retries=3):
     """
     เรียก Gemini API และคืน response text
     thinking=True → ใช้ thinking_level=HIGH (สำหรับ Phase 2)
+    retry อัตโนมัติเมื่อเจอ 429 rate limit
     """
+    import time
     cfg = types.GenerateContentConfig(max_output_tokens=8192)
     if thinking:
         cfg = types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
             max_output_tokens=8192,
         )
-    response = gemini_client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=prompt,
-        config=cfg,
-    )
-    return response.text.strip()
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = gemini_client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt,
+                config=cfg,
+            )
+            return response.text.strip()
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                # parse retry delay จาก error message ถ้ามี
+                wait = 30
+                import re
+                m = re.search(r"retry[^0-9]*(\d+)", err, re.IGNORECASE)
+                if m:
+                    wait = int(m.group(1)) + 5
+                if attempt < max_retries:
+                    print(f"  [rate limit] 429 — waiting {wait}s before retry {attempt}/{max_retries}...")
+                    time.sleep(wait)
+                    continue
+            raise  # re-raise ถ้าไม่ใช่ rate limit หรือหมด retry
 
 
 def normalize_link(url):
@@ -245,17 +263,20 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
     Phase 1: จัดประเภท TypeLabel + IssueLabels สำหรับ 1 batch (max 100)
     Returns: list of {"cid": str, "type_label": str, "issue_labels": str}
     """
+    def _clean(text):
+        return text.replace('"', "'").replace("\n", " ").replace("\r", " ")
+
     type_block  = "\n".join(
-        f'{t["name"]}: {t["criteria"]}' for t in type_criteria
+        f'{_clean(t["name"])}: {_clean(t["criteria"])}' for t in type_criteria
     ) + "\nOther: ความคิดเห็นที่ไม่ตรงกับประเภทใดข้างต้น"
 
     issue_block = "\n".join(
-        f'{i["name"]}: {i["criteria"]}' for i in issue_criteria
+        f'{_clean(i["name"])}: {_clean(i["criteria"])}' for i in issue_criteria
     ) + "\nOther: ประเด็นที่ไม่ตรงกับรายการใดข้างต้น"
 
     comments_block = ""
     for c in batch:
-        safe_text = c["text"].replace('"', "'").replace("\n", " ").replace("\r", " ")
+        safe_text = (c["text"].replace("\\", " ").replace('"', "'").replace("\n", " ").replace("\r", " ").replace("\t", " "))
         comments_block += f"---\nID: {c['cid']}\nTEXT: {safe_text}\n"
     comments_block += "---"
 
