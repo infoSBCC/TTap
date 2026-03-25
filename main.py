@@ -54,11 +54,11 @@ def _gemini_call(prompt, thinking=False, max_retries=3):
     retry อัตโนมัติเมื่อเจอ 429 rate limit
     """
     import time
-    cfg = types.GenerateContentConfig(max_output_tokens=8192)
+    cfg = types.GenerateContentConfig(max_output_tokens=16384)
     if thinking:
         cfg = types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
-            max_output_tokens=8192,
+            max_output_tokens=16384,
         )
     for attempt in range(1, max_retries + 1):
         try:
@@ -260,61 +260,58 @@ def fetch_comments(links, scrape_date):
 
 def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
     """
-    Phase 1: จัดประเภท TypeLabel + IssueLabels สำหรับ 1 batch
-    - ใช้ IDX (0,1,2,...) แทน CID เพื่อป้องกัน 19-digit number truncation
-    - ใช้ string ชื่อประเภท/ประเด็น (ไม่ใช้ index) เพื่อให้ตรงกับ Instruction sheet
-    Returns: list of {"cid": str, "type_label": str, "issue_labels": str}
+    Phase 1: จัดประเภท TypeLabel + IssueLabels
+    NameType/NameIssue เป็น English single word → ง่ายต่อการ validate
     """
     type_names  = [t["name"] for t in type_criteria] + ["Other"]
     issue_names = [i["name"] for i in issue_criteria] + ["Other"]
+    valid_types  = set(type_names)
+    valid_issues = set(issue_names)
 
     def _clean(text):
         return text.replace('"', "'").replace("\n", " ").replace("\r", " ")
 
     type_block = "\n".join(
-        f'- {_clean(t["name"])}: {_clean(t["criteria"][:100])}'
+        f'- {t["name"]}: {_clean(t["criteria"][:120])}'
         for t in type_criteria
-    ) + "\n- Other: ความคิดเห็นที่ไม่ตรงกับประเภทใดข้างต้น"
+    ) + "\n- Other: ไม่ตรงกับประเภทใด"
 
     issue_block = "\n".join(
-        f'- {_clean(i["name"])}: {_clean(i["criteria"][:100])}'
+        f'- {i["name"]}: {_clean(i["criteria"][:120])}'
         for i in issue_criteria
-    ) + "\n- Other: ประเด็นที่ไม่ตรงกับรายการใด"
+    ) + "\n- Other: ไม่ตรงกับประเด็นใด"
 
-    valid_types  = set(type_names)
-    valid_issues = set(issue_names)
+    valid_type_str  = ", ".join(f'"{n}"' for n in type_names)
+    valid_issue_str = ", ".join(f'"{n}"' for n in issue_names)
 
-    # idx_to_cid: ใช้ idx แทน CID เพื่อป้องกัน Gemini truncate ตัวเลขยาว
     idx_to_cid = {str(i): c["cid"] for i, c in enumerate(batch)}
 
     comments_block = ""
     for i, c in enumerate(batch):
         safe_text = (c["text"]
-                     .replace("\\", " ")
-                     .replace('"', "'")
-                     .replace("\n", " ")
-                     .replace("\r", " ")
-                     .replace("\t", " "))
+                     .replace("\\", " ").replace('"', "'")
+                     .replace("\n", " ").replace("\r", " ").replace("\t", " "))
         comments_block += f"---\nIDX: {i}\nTEXT: {safe_text}\n"
     comments_block += "---"
 
     prompt = (
         f"{instruction}\n\n"
-        "หมายเหตุ: ใช้ IDX เป็น identifier แทน ID ในรูปแบบตอบกลับ\n\n"
         f"=== ประเภทความคิดเห็น ===\n{type_block}\n\n"
         f"=== ประเด็น ===\n{issue_block}\n\n"
         f"=== ความคิดเห็น ===\n{comments_block}\n\n"
+        f"Valid type values: {valid_type_str}\n"
+        f"Valid issue values: {valid_issue_str}\n\n"
         "ตอบเป็น JSON array เท่านั้น รูปแบบ:\n"
-        '[{"idx":0, "type":"ชื่อประเภท", "issues":["ชื่อประเด็น1","ชื่อประเด็น2"]}]\n'
-        "type ต้องเป็นชื่อประเภทที่ระบุข้างต้นเท่านั้น\n"
-        "issues ต้องเป็น list ของชื่อประเด็นที่ระบุข้างต้น ถ้าไม่มีให้ใส่ [\"Other\"]\n"
+        '[{"idx":0, "type":"Criticize", "issues":["Burden","Trust"]}]\n'
+        "type ต้องเป็นค่าจาก Valid type values เท่านั้น\n"
+        "issues ต้องเป็น list จาก Valid issue values เท่านั้น ถ้าไม่มีให้ใส่ [\"Other\"]\n"
         "ห้ามอธิบาย ห้ามใส่ markdown"
     )
 
     try:
         print(f"  [Gemini] classifying {len(batch)} comments...")
         raw = _gemini_call(prompt)
-        print(f"  [RAW] {raw[:300]}")
+        print(f"  [RAW] {raw[:200]}")
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
         if raw.endswith("```"):
@@ -334,9 +331,9 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
                 continue
             responded_idxs.add(idx)
 
-            # รองรับทั้ง string ("วิจารณ์...") และ index number (3)
-            raw_type = item.get("type", len(type_criteria))
-            if isinstance(raw_type, int) or str(raw_type).isdigit():
+            # type — รองรับทั้ง string และ int index (fallback)
+            raw_type = item.get("type", "Other")
+            if isinstance(raw_type, int) or str(raw_type).strip().isdigit():
                 try:
                     type_label = type_names[int(raw_type)]
                 except (IndexError, ValueError):
@@ -346,11 +343,11 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
                 if type_label not in valid_types:
                     type_label = "Other"
 
-            # รองรับทั้ง string list และ index number list
-            raw_issues = item.get("issues", [len(issue_criteria)])
+            # issues — รองรับทั้ง string list และ int index list (fallback)
+            raw_issues = item.get("issues", ["Other"])
             issue_labels_list = []
             for ii in raw_issues:
-                if isinstance(ii, int) or str(ii).isdigit():
+                if isinstance(ii, int) or str(ii).strip().isdigit():
                     try:
                         issue_labels_list.append(issue_names[int(ii)])
                     except (IndexError, ValueError):
@@ -360,17 +357,19 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
                     issue_labels_list.append(s if s in valid_issues else "Other")
             if not issue_labels_list:
                 issue_labels_list = ["Other"]
+
             issue_str = "|".join(issue_labels_list)
-            print(f"  [LABEL] idx={idx} → type={type_label} | issues={issue_str}")
+            print(f"  [LABEL] idx={idx} → {type_label} | {issue_str}")
             output.append({
                 "cid":          cid,
                 "type_label":   type_label,
                 "issue_labels": issue_str,
             })
-        # fill missing idx
+
+        # fill missing
         for idx, cid in idx_to_cid.items():
             if idx not in responded_idxs:
-                print(f"  [MISSING] idx={idx} → fallback Other")
+                print(f"  [MISSING] idx={idx} → Other")
                 output.append({"cid": cid, "type_label": "Other", "issue_labels": "Other"})
         return output
 
