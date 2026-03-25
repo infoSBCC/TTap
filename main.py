@@ -446,15 +446,20 @@ def generate_issue_criteria_for_group(group, sample_comments, instruction, exist
     existing_str = ", ".join(existing_issue_names) if existing_issue_names else "ยังไม่มี"
 
     prompt = (
-        f"{instruction}\n\n"
-        f"KeywordGroup ใหม่: {group}\n"
+        f"คุณเป็นผู้เชี่ยวชาญด้านการวิเคราะห์ความคิดเห็น\n\n"
+        f"KeywordGroup: {group}\n"
         f"ประเด็นที่มีอยู่แล้ว (ห้ามซ้ำ): {existing_str}\n\n"
         f"ตัวอย่าง comment ใน group นี้ ({len(sample)} รายการ):\n{comments_block}\n\n"
         "งาน: วิเคราะห์ comment เหล่านี้แล้วสร้างประเด็น (Issue) ที่เหมาะสมสำหรับ keyword group นี้\n"
-        "จำนวน: 3-8 ประเด็น ขึ้นกับความหลากหลายของ comment\n"
-        "ชื่อประเด็น: ภาษาอังกฤษ single word ไม่มี space (เช่น Transit, Burden, Trust)\n\n"
+        "จำนวน: 3-8 ประเด็น ขึ้นกับความหลากหลายของ comment\n\n"
+        "กฎสำคัญ:\n"
+        "- ชื่อประเด็น (name) ต้องเป็นภาษาอังกฤษเท่านั้น\n"
+        "- ชื่อต้องเป็น single word ไม่มี space ไม่มี underscore\n"
+        "- ตัวอย่างชื่อที่ถูกต้อง: Transit, Burden, Trust, Zoning, Scope\n"
+        "- ตัวอย่างชื่อที่ผิด: ขนส่งสาธารณะ, Public_Transit, Public Transit\n"
+        "- criteria อธิบายเป็นภาษาไทย 1-2 ประโยค\n\n"
         "ตอบเป็น JSON array เท่านั้น รูปแบบ:\n"
-        '[{"name":"IssueName", "criteria":"อธิบายลักษณะ comment ที่จัดอยู่ในประเด็นนี้ 1-2 ประโยค"}]\n'
+        '[{"name":"IssueName", "criteria":"อธิบายลักษณะ comment ที่จัดอยู่ในประเด็นนี้"}]\n'
         "ห้ามอธิบายเพิ่ม ห้ามใส่ markdown"
     )
 
@@ -680,7 +685,11 @@ def main():
     # จัดกลุ่ม unlabeled comment ตาม KeywordGroup
     groups_map = {}   # {group: [comment]}
     for c in unlabeled:
-        group = postid_to_group.get(c["post_id"], "_unknown_") or "_unknown_"
+        group = postid_to_group.get(c["post_id"], "") or ""
+        # ถ้า PostID ว่างหรือหาไม่เจอ → ใช้ group แรกที่มี criteria (ไม่ใช่ _global_)
+        if not group:
+            real_groups = [g for g in issue_criteria_all if g not in ("_global_", "_unknown_")]
+            group = real_groups[0] if real_groups else "_unknown_"
         groups_map.setdefault(group, []).append(c)
 
     print(f"  comment groups : { {g: len(v) for g, v in groups_map.items()} }")
