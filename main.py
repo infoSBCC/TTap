@@ -24,6 +24,9 @@ from sheets import (
     get_other_instruction,
     get_unlabeled_comments,
     get_other_issue_comments,
+    get_other_issue_comments_by_group,
+    get_postid_to_group,
+    get_issue_criteria_all,
     batch_update_type_and_issue,
     batch_update_issue_only,
     append_issue_criteria,
@@ -428,6 +431,58 @@ def detect_other_issues(other_comments, issue_criteria, other_instruction):
         return [], {}
 
 
+def generate_issue_criteria_for_group(group, sample_comments, instruction, existing_issue_names):
+    """
+    ให้ Gemini สร้าง IssueCriteria ชุดใหม่สำหรับ KeywordGroup ที่ยังไม่มี criteria
+    sample_comments: list of {"cid", "text"}  (ใช้ไม่เกิน 100 ตัวอย่าง)
+    Returns: list of {"name": str, "criteria": str}
+    """
+    import random
+    sample = sample_comments if len(sample_comments) <= 100 else random.sample(sample_comments, 100)
+
+    comments_block = "\n".join(
+        f'- {c["text"].replace(chr(10)," ")[:150]}' for c in sample
+    )
+    existing_str = ", ".join(existing_issue_names) if existing_issue_names else "ยังไม่มี"
+
+    prompt = (
+        f"{instruction}\n\n"
+        f"KeywordGroup ใหม่: {group}\n"
+        f"ประเด็นที่มีอยู่แล้ว (ห้ามซ้ำ): {existing_str}\n\n"
+        f"ตัวอย่าง comment ใน group นี้ ({len(sample)} รายการ):\n{comments_block}\n\n"
+        "งาน: วิเคราะห์ comment เหล่านี้แล้วสร้างประเด็น (Issue) ที่เหมาะสมสำหรับ keyword group นี้\n"
+        "จำนวน: 3-8 ประเด็น ขึ้นกับความหลากหลายของ comment\n"
+        "ชื่อประเด็น: ภาษาอังกฤษ single word ไม่มี space (เช่น Transit, Burden, Trust)\n\n"
+        "ตอบเป็น JSON array เท่านั้น รูปแบบ:\n"
+        '[{"name":"IssueName", "criteria":"อธิบายลักษณะ comment ที่จัดอยู่ในประเด็นนี้ 1-2 ประโยค"}]\n'
+        "ห้ามอธิบายเพิ่ม ห้ามใส่ markdown"
+    )
+
+    try:
+        print(f"  [Gemini] generating IssueCriteria for group '{group}' ({len(sample)} samples)...")
+        raw = _gemini_call(prompt)
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3].strip()
+        start = raw.find("[")
+        end   = raw.rfind("]")
+        if start != -1 and end != -1:
+            raw = raw[start:end+1]
+        results = json.loads(raw)
+        new_criteria = [
+            {"name": str(r.get("name","")).strip(),
+             "criteria": str(r.get("criteria","")).strip()}
+            for r in results
+            if str(r.get("name","")).strip()
+        ]
+        print(f"  generated {len(new_criteria)} issue(s): {[c['name'] for c in new_criteria]}")
+        return new_criteria
+    except Exception as e:
+        print(f"  [warn] generate criteria failed: {e}")
+        return []
+
+
 def main():
     # ------------------------------------------------------------------ #
     print("=" * 50)
@@ -612,25 +667,30 @@ def main():
     print("STEP 8: Classify Comments (Phase 1)")
     print("=" * 50)
 
-    type_criteria     = get_type_criteria()
-    issue_criteria    = get_issue_criteria()
-    instruction       = get_instruction()
-    unlabeled         = get_unlabeled_comments()
+    type_criteria        = get_type_criteria()
+    issue_criteria_all   = get_issue_criteria_all()   # dict {group: [criteria]}
+    instruction          = get_instruction()
+    unlabeled            = get_unlabeled_comments()   # รวม post_id แล้ว
+    postid_to_group      = get_postid_to_group()
 
-    # debug: ตรวจสอบว่าโหลดข้อมูลมาได้จริงไหม
     print(f"  types loaded   : {len(type_criteria)}")
-    for t in type_criteria:
-        print(f"    - {t['name']}: {t['criteria'][:60]}")
-    print(f"  issues loaded  : {len(issue_criteria)}")
-    for i in issue_criteria:
-        print(f"    - {i['name']}: {i['criteria'][:60]}")
+    print(f"  issue groups   : {list(issue_criteria_all.keys())}")
     print(f"  instruction len: {len(instruction)} chars")
-    if not instruction:
-        print("  [WARN] instruction is EMPTY — check Instruction sheet, column InstructionDetail")
-    if not type_criteria:
-        print("  [WARN] type_criteria is EMPTY — check TypeCriteria sheet, column NameType / CriteriaType")
-    if not issue_criteria:
-        print("  [WARN] issue_criteria is EMPTY — check IssueCriteria sheet, column NameIssue / CriteriaIssue")
+
+    # จัดกลุ่ม unlabeled comment ตาม KeywordGroup
+    groups_map = {}   # {group: [comment]}
+    for c in unlabeled:
+        group = postid_to_group.get(c["post_id"], "_unknown_")
+        groups_map.setdefault(group, []).append(c)
+
+    print(f"  comment groups : { {g: len(v) for g, v in groups_map.items()} }")
+
+    # รวม existing issue names สำหรับตรวจซ้ำตอน generate
+    all_existing_names = {
+        item["name"]
+        for items in issue_criteria_all.values()
+        for item in items
+    }
 
     # build cid → list of row_indices (รองรับ duplicate CID)
     cid_to_rows = {}
@@ -638,60 +698,83 @@ def main():
         cid_to_rows.setdefault(c["cid"], []).append(c["row_index"])
 
     label_updates = []
-    for i in range(0, len(unlabeled), CLASSIFY_BATCH_SIZE):
-        chunk = unlabeled[i : i + CLASSIFY_BATCH_SIZE]
-        print(f"  [Batch] comments {i+1}-{i+len(chunk)} / {len(unlabeled)}")
-        results = classify_comments_batch(chunk, type_criteria, issue_criteria, instruction)
-        for r in results:
-            rows = cid_to_rows.get(r["cid"], [])
-            for row in rows:   # update ทุก row ที่มี CID นี้
-                label_updates.append({
-                    "row_index":    row,
-                    "type_label":   r["type_label"],
-                    "issue_labels": r["issue_labels"],
-                })
+
+    for group, group_comments in groups_map.items():
+        print(f"\n  === Group: {group} ({len(group_comments)} comments) ===")
+
+        # ดึง IssueCriteria ของ group นี้
+        issue_criteria = issue_criteria_all.get(group, [])
+
+        # ถ้ายังไม่มี criteria → สร้างใหม่อัตโนมัติ
+        if not issue_criteria:
+            print(f"  [NEW GROUP] '{group}' has no IssueCriteria — generating...")
+            issue_criteria = generate_issue_criteria_for_group(
+                group, group_comments, instruction, all_existing_names
+            )
+            if issue_criteria:
+                append_issue_criteria(issue_criteria, keyword_group=group)
+                issue_criteria_all[group] = issue_criteria
+                all_existing_names.update(c["name"] for c in issue_criteria)
+            else:
+                print(f"  [warn] could not generate criteria for '{group}' — using Other for all")
+
+        # Classify ทีละ batch
+        for i in range(0, len(group_comments), CLASSIFY_BATCH_SIZE):
+            chunk = group_comments[i : i + CLASSIFY_BATCH_SIZE]
+            print(f"  [Batch] {i+1}-{i+len(chunk)} / {len(group_comments)}")
+            results = classify_comments_batch(chunk, type_criteria, issue_criteria, instruction)
+            for r in results:
+                for row in cid_to_rows.get(r["cid"], []):
+                    label_updates.append({
+                        "row_index":    row,
+                        "type_label":   r["type_label"],
+                        "issue_labels": r["issue_labels"],
+                    })
 
     batch_update_type_and_issue(label_updates)
-    print(f"  classified {len(label_updates)} comment(s)")
+    print(f"\n  classified {len(label_updates)} comment(s) total")
     print()
 
     # ------------------------------------------------------------------ #
     print("=" * 50)
-    print("STEP 9: Other Issue Detection (Phase 2)")
+    print("STEP 9: Other Issue Detection (Phase 2) — per KeywordGroup")
     print("=" * 50)
 
-    other_comments = get_other_issue_comments()
+    other_instruction  = get_other_instruction()
+    # จัดกลุ่ม Other comments ตาม KeywordGroup
+    other_by_group = get_other_issue_comments_by_group(postid_to_group)
 
-    if len(other_comments) <= OTHER_ISSUE_THRESHOLD:
-        print(f"  Other ({len(other_comments)}) ≤ {OTHER_ISSUE_THRESHOLD} — skip phase 2. done!")
-        return
+    total_issue_updates = []
 
-    print(f"  Other ({len(other_comments)}) > {OTHER_ISSUE_THRESHOLD} — running detection...")
-    other_instruction = get_other_instruction()
-    new_issues, mapping = detect_other_issues(other_comments, issue_criteria, other_instruction)
+    for group, other_comments in other_by_group.items():
+        if len(other_comments) <= OTHER_ISSUE_THRESHOLD:
+            print(f"  [{group}] Other={len(other_comments)} ≤ {OTHER_ISSUE_THRESHOLD} — skip")
+            continue
 
-    if not new_issues:
-        print("  no new issues found. done!")
-        return
+        print(f"  [{group}] Other={len(other_comments)} > {OTHER_ISSUE_THRESHOLD} — running detection...")
+        group_criteria = issue_criteria_all.get(group, [])
+        new_issues, mapping = detect_other_issues(other_comments, group_criteria, other_instruction)
 
-    print(f"  new issues: {[n['name'] for n in new_issues]}")
+        if not new_issues:
+            print(f"  [{group}] no new issues found")
+            continue
 
-    # อัปเดต IssueLabels ของ comment ที่ถูก map ไปประเด็นใหม่
-    issue_updates = []
-    cid_to_row_other = {c["cid"]: c["row_index"] for c in other_comments}
-    for cid, new_issue in mapping.items():
-        row = cid_to_row_other.get(cid)
-        if row and new_issue != "Other":
-            issue_updates.append({
-                "row_index":    row,
-                "issue_labels": new_issue,
-            })
+        print(f"  [{group}] new issues: {[n['name'] for n in new_issues]}")
 
-    batch_update_issue_only(issue_updates)
-    print(f"  updated {len(issue_updates)} comment(s) with new issues")
+        cid_to_row_other = {c["cid"]: c["row_index"] for c in other_comments}
+        for cid, new_issue in mapping.items():
+            row = cid_to_row_other.get(cid)
+            if row and new_issue != "Other":
+                total_issue_updates.append({
+                    "row_index":    row,
+                    "issue_labels": new_issue,
+                })
 
-    # append ประเด็นใหม่ไปที่ IssueCriteria sheet
-    append_issue_criteria(new_issues)
+        append_issue_criteria(new_issues, keyword_group=group)
+
+    if total_issue_updates:
+        batch_update_issue_only(total_issue_updates)
+        print(f"  updated {len(total_issue_updates)} comment(s) with new issues")
     print("done!")
 
 
