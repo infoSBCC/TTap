@@ -260,35 +260,52 @@ def fetch_comments(links, scrape_date):
 
 def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
     """
-    Phase 1: จัดประเภท TypeLabel + IssueLabels สำหรับ 1 batch (max 100)
+    Phase 1: จัดประเภท TypeLabel + IssueLabels สำหรับ 1 batch
+    ใช้ IDX (0,1,2,...) แทน CID และ index number แทนชื่อ type/issue
+    เพื่อป้องกัน Gemini truncate ตัวเลข 19 หลัก และ JSON error จากชื่อภาษาไทย
     Returns: list of {"cid": str, "type_label": str, "issue_labels": str}
     """
+    type_names  = [t["name"] for t in type_criteria] + ["Other"]
+    issue_names = [i["name"] for i in issue_criteria] + ["Other"]
+    other_type_idx  = len(type_criteria)
+    other_issue_idx = len(issue_criteria)
+
     def _clean(text):
         return text.replace('"', "'").replace("\n", " ").replace("\r", " ")
 
-    type_block  = "\n".join(
-        f'{_clean(t["name"])}: {_clean(t["criteria"])}' for t in type_criteria
-    ) + "\nOther: ความคิดเห็นที่ไม่ตรงกับประเภทใดข้างต้น"
+    type_block = "\n".join(
+        f'{idx}={_clean(t["name"])}: {_clean(t["criteria"][:80])}'
+        for idx, t in enumerate(type_criteria)
+    ) + f"\n{other_type_idx}=Other"
 
     issue_block = "\n".join(
-        f'{_clean(i["name"])}: {_clean(i["criteria"])}' for i in issue_criteria
-    ) + "\nOther: ประเด็นที่ไม่ตรงกับรายการใดข้างต้น"
+        f'{idx}={_clean(i["name"])}: {_clean(i["criteria"][:80])}'
+        for idx, i in enumerate(issue_criteria)
+    ) + f"\n{other_issue_idx}=Other"
+
+    idx_to_cid = {str(i): c["cid"] for i, c in enumerate(batch)}
 
     comments_block = ""
-    for c in batch:
-        safe_text = (c["text"].replace("\\", " ").replace('"', "'").replace("\n", " ").replace("\r", " ").replace("\t", " "))
-        comments_block += f"---\nID: {c['cid']}\nTEXT: {safe_text}\n"
+    for i, c in enumerate(batch):
+        safe_text = (c["text"]
+                     .replace("\\", " ")
+                     .replace('"', "'")
+                     .replace("\n", " ")
+                     .replace("\r", " ")
+                     .replace("\t", " "))
+        comments_block += f"---\nIDX: {i}\nTEXT: {safe_text}\n"
     comments_block += "---"
 
     prompt = (
         f"{instruction}\n\n"
-        f"=== ประเภทความคิดเห็น (TypeCriteria) ===\n{type_block}\n\n"
-        f"=== ประเด็น (IssueCriteria) ===\n{issue_block}\n\n"
-        f"=== ความคิดเห็นที่ต้องจัดประเภท ===\n{comments_block}\n\n"
+        f"=== ประเภทความคิดเห็น ===\n{type_block}\n\n"
+        f"=== ประเด็น ===\n{issue_block}\n\n"
+        f"=== ความคิดเห็น ===\n{comments_block}\n\n"
         "ตอบเป็น JSON array เท่านั้น รูปแบบ:\n"
-        '[{"id":"...", "type":"...", "issues":["..."]}]\n'
-        "ถ้าไม่มี issue ที่ตรง ให้ issues = [\"Other\"]\n"
-        "ห้ามอธิบายเพิ่มเติม ห้ามใส่ markdown"
+        f'[{{"idx":0, "type":2, "issues":[1,3]}}]\n'
+        "type และ issues ใช้ตัวเลข index ข้างต้นเท่านั้น\n"
+        f"ถ้าไม่มี issue ตรง ให้ issues=[{other_issue_idx}]\n"
+        "ห้ามอธิบาย ห้ามใส่ markdown"
     )
 
     try:
@@ -298,7 +315,6 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
         if raw.endswith("```"):
             raw = raw[:-3].strip()
-        # extract JSON array — หา [ ... ] แรก เพราะ Gemini บางครั้งมีข้อความนำหน้า
         start = raw.find("[")
         end   = raw.rfind("]")
         if start != -1 and end != -1:
@@ -306,15 +322,35 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
 
         results = json.loads(raw)
         output  = []
+        responded_idxs = set()
         for item in results:
-            issues_list = item.get("issues", ["Other"])
-            if not issues_list:
-                issues_list = ["Other"]
+            idx = str(item.get("idx", ""))
+            cid = idx_to_cid.get(idx)
+            if not cid:
+                continue
+            responded_idxs.add(idx)
+            try:
+                type_label = type_names[int(item.get("type", other_type_idx))]
+            except (IndexError, ValueError, TypeError):
+                type_label = "Other"
+            raw_issues = item.get("issues", [other_issue_idx])
+            issue_labels_list = []
+            for ii in raw_issues:
+                try:
+                    issue_labels_list.append(issue_names[int(ii)])
+                except (IndexError, ValueError, TypeError):
+                    issue_labels_list.append("Other")
+            if not issue_labels_list:
+                issue_labels_list = ["Other"]
             output.append({
-                "cid":          str(item.get("id", "")),
-                "type_label":   str(item.get("type", "Other")),
-                "issue_labels": "|".join(issues_list),
+                "cid":          cid,
+                "type_label":   type_label,
+                "issue_labels": "|".join(issue_labels_list),
             })
+        # fill missing idx
+        for idx, cid in idx_to_cid.items():
+            if idx not in responded_idxs:
+                output.append({"cid": cid, "type_label": "Other", "issue_labels": "Other"})
         return output
 
     except Exception as e:
