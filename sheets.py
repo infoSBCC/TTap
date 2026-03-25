@@ -307,15 +307,35 @@ def get_type_criteria():
     ]
 
 
-def get_issue_criteria():
-    """คืน list of {"name": str, "criteria": str}"""
+def get_issue_criteria_all():
+    """
+    คืน dict {keyword_group: [{"name": str, "criteria": str}]}
+    ถ้า KeywordGroup ว่าง → ใส่ใน group "_global_"
+    """
     sheet = get_sheet(CRITERIA_SHEET_ID, ISSUE_CRITERIA_SHEET_NAME)
-    return [
-        {"name": str(r.get("NameIssue", "")).strip(),
-         "criteria": str(r.get("CriteriaIssue", "")).strip()}
-        for r in sheet.get_all_records()
-        if str(r.get("NameIssue", "")).strip()
-    ]
+    result = {}
+    for r in sheet.get_all_records():
+        name  = str(r.get("NameIssue", "")).strip()
+        crit  = str(r.get("CriteriaIssue", "")).strip()
+        group = str(r.get("KeywordGroup", "")).strip() or "_global_"
+        if name:
+            result.setdefault(group, []).append({"name": name, "criteria": crit})
+    return result
+
+
+def get_issue_criteria(keyword_group=None):
+    """
+    คืน list of {"name": str, "criteria": str} สำหรับ keyword_group ที่ระบุ
+    ถ้าไม่ระบุ → คืนทั้งหมด
+    """
+    all_criteria = get_issue_criteria_all()
+    if keyword_group is None:
+        # รวมทุก group
+        combined = []
+        for items in all_criteria.values():
+            combined.extend(items)
+        return combined
+    return all_criteria.get(keyword_group, [])
 
 
 def get_instruction():
@@ -336,16 +356,62 @@ def get_other_instruction():
     return ""
 
 
-def append_issue_criteria(new_issues):
+
+
+def get_postid_to_group():
     """
-    Append ประเด็นใหม่ไปที่ IssueCriteria sheet
+    อ่าน UniquePost คืน dict {post_id: keyword_group}
+    """
+    sheet = get_sheet(UNIQUE_POST_SHEET_ID, UNIQUE_POST_SHEET_NAME)
+    records = sheet.get_all_records()
+    result = {}
+    for row in records:
+        post_id = str(row.get("PostID", "")).strip()
+        group   = str(row.get("keyword group", "")).strip()
+        if post_id:
+            result[post_id] = group
+    return result
+
+
+def get_other_issue_comments_by_group(postid_to_group):
+    """
+    คืน dict {keyword_group: [{"row_index", "cid", "text"}]}
+    สำหรับ comment ที่ CommentIssue = "Other"
+    """
+    sheet = get_sheet(COMMENTS_SHEET_ID, COMMENTS_SHEET_NAME)
+    records = sheet.get_all_records()
+    result = {}
+    total = 0
+    for i, row in enumerate(records):
+        issue_label = str(row.get("CommentIssue", "")).strip()
+        if issue_label == "Other":
+            cid     = str(row.get("CommentID", "")).strip()
+            text    = str(row.get("CommentText", "")).strip()
+            post_id = str(row.get("PostID", "")).strip()
+            group   = postid_to_group.get(post_id, "_unknown_")
+            if not cid:
+                cid = f"row_{i+2}"
+            result.setdefault(group, []).append({
+                "row_index": i + 2,
+                "cid":  cid,
+                "text": text,
+            })
+            total += 1
+    print(f"  IssueLabels=Other comments: {total} across {len(result)} group(s)")
+    return result
+
+
+def append_issue_criteria(new_issues, keyword_group=""):
+    """
+    Append ประเด็นใหม่ไปที่ IssueCriteria sheet พร้อม KeywordGroup
     new_issues: list of {"name": str, "criteria": str}
     """
     sheet = get_sheet(CRITERIA_SHEET_ID, ISSUE_CRITERIA_SHEET_NAME)
-    rows = [[item["name"], item["criteria"]] for item in new_issues]
+    rows = [[item["name"], item["criteria"], keyword_group] for item in new_issues]
     if rows:
         sheet.append_rows(rows, value_input_option="USER_ENTERED")
-        print(f"  appended {len(rows)} new issue(s) to IssueCriteria")
+        print(f"  appended {len(rows)} new issue(s) to IssueCriteria (group={keyword_group})")
+
 
 
 # --- Comments sheet label operations ---
@@ -371,10 +437,12 @@ def get_unlabeled_comments():
             text = str(row.get("CommentText", "")).strip()
             if not cid:
                 cid = f"row_{i+2}"
+            post_id = str(row.get("PostID", "")).strip()
             result.append({
                 "row_index": i + 2,
-                "cid":  cid,
-                "text": text,
+                "cid":       cid,
+                "text":      text,
+                "post_id":   post_id,
             })
     print(f"  unlabeled comments: {len(result)}")
     return result
@@ -383,7 +451,7 @@ def get_unlabeled_comments():
 def get_other_issue_comments():
     """
     คืน list of {"row_index": int, "cid": str, "text": str}
-    สำหรับ comment ที่ IssueLabels = "Other"
+    สำหรับ comment ที่ CommentIssue = "Other"
     """
     sheet = get_sheet(COMMENTS_SHEET_ID, COMMENTS_SHEET_NAME)
     records = sheet.get_all_records()
@@ -391,14 +459,16 @@ def get_other_issue_comments():
     for i, row in enumerate(records):
         issue_label = str(row.get("CommentIssue", "")).strip()
         if issue_label == "Other":
-            cid  = str(row.get("CommentID", "")).strip()
-            text = str(row.get("CommentText", "")).strip()
+            cid     = str(row.get("CommentID", "")).strip()
+            text    = str(row.get("CommentText", "")).strip()
+            post_id = str(row.get("PostID", "")).strip()
             if not cid:
                 cid = f"row_{i+2}"
             result.append({
                 "row_index": i + 2,
-                "cid":  cid,
-                "text": text,
+                "cid":       cid,
+                "text":      text,
+                "post_id":   post_id,
             })
     print(f"  IssueLabels=Other comments: {len(result)}")
     return result
