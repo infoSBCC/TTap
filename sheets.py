@@ -361,13 +361,14 @@ def get_other_instruction():
 def get_postid_to_group():
     """
     อ่าน UniquePost คืน dict {post_id: keyword_group}
+    ถ้า keyword group ว่าง → ใช้ "_unknown_"
     """
     sheet = get_sheet(UNIQUE_POST_SHEET_ID, UNIQUE_POST_SHEET_NAME)
     records = sheet.get_all_records()
     result = {}
     for row in records:
         post_id = str(row.get("PostID", "")).strip()
-        group   = str(row.get("keyword group", "")).strip()
+        group   = str(row.get("keyword group", "")).strip() or "_unknown_"
         if post_id:
             result[post_id] = group
     return result
