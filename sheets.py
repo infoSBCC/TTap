@@ -351,10 +351,15 @@ def get_unlabeled_comments():
     for i, row in enumerate(records):
         type_label = str(row.get("CommentType", "")).strip()
         if not type_label:
+            cid  = str(row.get("CommentID", "")).strip()
+            text = str(row.get("CommentText", "")).strip()
+            # fallback: ถ้า CommentID ว่างให้ใช้ row_index เป็น cid
+            if not cid:
+                cid = f"row_{i+2}"
             result.append({
-                "row_index": i + 2,  # +2 เพราะ header อยู่แถวที่ 1
-                "cid":  str(row.get("CommentID", "")).strip(),
-                "text": str(row.get("CommentText", "")).strip(),
+                "row_index": i + 2,
+                "cid":  cid,
+                "text": text,
             })
     print(f"  unlabeled comments: {len(result)}")
     return result
@@ -371,10 +376,14 @@ def get_other_issue_comments():
     for i, row in enumerate(records):
         issue_label = str(row.get("CommentIssue", "")).strip()
         if issue_label == "Other":
+            cid  = str(row.get("CommentID", "")).strip()
+            text = str(row.get("CommentText", "")).strip()
+            if not cid:
+                cid = f"row_{i+2}"
             result.append({
                 "row_index": i + 2,
-                "cid":  str(row.get("CommentID", "")).strip(),
-                "text": str(row.get("CommentText", "")).strip(),
+                "cid":  cid,
+                "text": text,
             })
     print(f"  IssueLabels=Other comments: {len(result)}")
     return result
@@ -407,7 +416,10 @@ def batch_update_type_and_issue(updates):
         cell_data.append({"range": gspread.utils.rowcol_to_a1(r, issue_col),
                           "values": [[u["issue_labels"]]]})
 
-    sheet.batch_update(cell_data, value_input_option="USER_ENTERED")
+    # แบ่ง chunk ละ 500 ranges เพื่อไม่เกิน Google Sheets API limit (~1000 ranges/request)
+    CHUNK = 500
+    for i in range(0, len(cell_data), CHUNK):
+        sheet.batch_update(cell_data[i:i+CHUNK], value_input_option="USER_ENTERED")
     print(f"  batch_update: {len(updates)} comment(s) labeled")
 
 
@@ -431,5 +443,7 @@ def batch_update_issue_only(updates):
          "values": [[u["issue_labels"]]]}
         for u in updates
     ]
-    sheet.batch_update(cell_data, value_input_option="USER_ENTERED")
+    CHUNK = 500
+    for i in range(0, len(cell_data), CHUNK):
+        sheet.batch_update(cell_data[i:i+CHUNK], value_input_option="USER_ENTERED")
     print(f"  batch_update issue: {len(updates)} comment(s) updated")
