@@ -311,6 +311,7 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
     try:
         print(f"  [Gemini] classifying {len(batch)} comments...")
         raw = _gemini_call(prompt)
+        print(f"  [RAW] {raw[:300]}")   # log 300 chars แรกของ response
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
         if raw.endswith("```"):
@@ -327,6 +328,7 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
             idx = str(item.get("idx", ""))
             cid = idx_to_cid.get(idx)
             if not cid:
+                print(f"  [WARN] idx={idx} not in idx_to_cid — skipping")
                 continue
             responded_idxs.add(idx)
             try:
@@ -342,19 +344,23 @@ def classify_comments_batch(batch, type_criteria, issue_criteria, instruction):
                     issue_labels_list.append("Other")
             if not issue_labels_list:
                 issue_labels_list = ["Other"]
+            issue_str = "|".join(issue_labels_list)
+            print(f"  [LABEL] idx={idx} cid={cid} → type={type_label} | issues={issue_str}")
             output.append({
                 "cid":          cid,
                 "type_label":   type_label,
-                "issue_labels": "|".join(issue_labels_list),
+                "issue_labels": issue_str,
             })
         # fill missing idx
         for idx, cid in idx_to_cid.items():
             if idx not in responded_idxs:
+                print(f"  [MISSING] idx={idx} cid={cid} → fallback Other")
                 output.append({"cid": cid, "type_label": "Other", "issue_labels": "Other"})
         return output
 
     except Exception as e:
-        print(f"  [warn] classify batch failed: {e} — marking as Other")
+        print(f"  [warn] classify batch failed: {e}")
+        print(f"  [RAW on error] {raw[:300] if 'raw' in dir() else 'no raw'}")
         return [{"cid": c["cid"], "type_label": "Other", "issue_labels": "Other"}
                 for c in batch]
 
