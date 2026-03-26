@@ -25,7 +25,6 @@ from sheets import (
     get_unlabeled_comments,
     get_other_issue_comments,
     get_other_issue_comments_by_group,
-    get_postid_to_group,
     get_issue_criteria_all,
     batch_update_type_and_issue,
     batch_update_issue_only,
@@ -208,7 +207,7 @@ def fetch_stats(links):
 
 
 
-def fetch_comments(links, scrape_date):
+def fetch_comments(links, scrape_date, link_to_group=None):
     """
     Run xtdata/tiktok-comment-scraper สำหรับ links ที่ผ่าน delta filter
     Returns: list of rows สำหรับ append ไป Comments sheet
@@ -243,6 +242,8 @@ def fetch_comments(links, scrape_date):
         # user fields เป็น nested dict: item["user"]["uid"]
         user = item.get("user", {}) or {}
 
+        video_link = aweme_to_link.get(aweme_id, "")
+        kw_group   = (link_to_group or {}).get(video_link, "")
         rows.append([
             post_id,
             str(item.get("cid", "")).strip(),
@@ -256,6 +257,7 @@ def fetch_comments(links, scrape_date):
             int(user.get("follower_count", 0) or 0),
             str(user.get("region", "")).strip(),
             scrape_date,
+            kw_group,
         ])
     return rows
 
@@ -612,8 +614,9 @@ def main():
         print("no qualifying links for stats. done!")
         return
 
-    yes_links      = [d["link"]    for d in yes_links_data]
-    link_to_postid = {d["link"]: d["post_id"] for d in yes_links_data}
+    yes_links        = [d["link"]    for d in yes_links_data]
+    link_to_postid   = {d["link"]: d["post_id"]       for d in yes_links_data}
+    link_to_kwgroup  = {d["link"]: d.get("keyword_group", "") for d in yes_links_data}
 
     # Run stats actor (ส่งทีเดียวทั้งหมด)
     scrape_date = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -631,6 +634,7 @@ def main():
             s.get("shares",    0),
             s.get("bookmarks", 0),
             scrape_date,
+            link_to_kwgroup.get(link, ""),
         ])
 
     print(f"appending {len(all_post_rows)} rows to AllPost...")
@@ -657,9 +661,10 @@ def main():
     print("STEP 7: Scrape Comments → Comments sheet")
     print("=" * 50)
 
-    active_links  = [d["link"] for d in active_links_data]
-    scrape_date   = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    comment_rows  = fetch_comments(active_links, scrape_date)
+    active_links    = [d["link"] for d in active_links_data]
+    link_to_group   = {d["link"]: d.get("keyword_group", "") for d in active_links_data}
+    scrape_date     = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    comment_rows    = fetch_comments(active_links, scrape_date, link_to_group)
 
     print(f"appending {len(comment_rows)} comment rows to Comments sheet...")
     append_comments(comment_rows)
@@ -675,18 +680,16 @@ def main():
     type_criteria        = get_type_criteria()
     issue_criteria_all   = get_issue_criteria_all()   # dict {group: [criteria]}
     instruction          = get_instruction()
-    unlabeled            = get_unlabeled_comments()   # รวม post_id แล้ว
-    postid_to_group      = get_postid_to_group()
+    unlabeled            = get_unlabeled_comments()   # รวม post_id + keyword_group แล้ว
 
     print(f"  types loaded   : {len(type_criteria)}")
     print(f"  issue groups   : {list(issue_criteria_all.keys())}")
     print(f"  instruction len: {len(instruction)} chars")
 
-    # จัดกลุ่ม unlabeled comment ตาม KeywordGroup
+    # จัดกลุ่ม unlabeled comment ตาม KeywordGroup ที่อ่านตรงจาก Comments sheet
     groups_map = {}   # {group: [comment]}
     for c in unlabeled:
-        group = postid_to_group.get(c["post_id"], "") or ""
-        # ถ้า PostID ว่างหรือหาไม่เจอ → ใช้ group แรกที่มี criteria (ไม่ใช่ _global_)
+        group = c.get("keyword_group", "").strip()
         if not group:
             real_groups = [g for g in issue_criteria_all if g not in ("_global_", "_unknown_")]
             group = real_groups[0] if real_groups else "_unknown_"
@@ -754,7 +757,7 @@ def main():
 
     other_instruction  = get_other_instruction()
     # จัดกลุ่ม Other comments ตาม KeywordGroup
-    other_by_group = get_other_issue_comments_by_group(postid_to_group)
+    other_by_group = get_other_issue_comments_by_group()
 
     total_issue_updates = []
 
