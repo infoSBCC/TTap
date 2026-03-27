@@ -93,7 +93,7 @@ def _gemini_call(prompt, *, thinking=False):
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
             resp = gemini_client.models.generate_content(
-                model="gemini-3-flash-preview",
+                model="gemini-2.5-flash-lite",
                 contents=prompt,
                 config=cfg,
             )
