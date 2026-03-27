@@ -95,8 +95,8 @@ UNIQUE_POST_HEADERS = [
 ]
 
 ALL_POST_HEADERS = [
-    "Link", "PostID", "Like", "Comment", "Share", "Save","Views",
-    "ScrapeDate", "KeywordGroup",
+    "Link", "PostID", "Like", "Comment", "Share", "Save",
+    "Views", "ScrapeDate", "KeywordGroup",
 ]
 
 COMMENTS_HEADERS = [
