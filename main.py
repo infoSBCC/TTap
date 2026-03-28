@@ -254,7 +254,7 @@ def fetch_stats(links):
                 "comments":  int(item.get("comments", 0) or 0),
                 "shares":    int(item.get("shares", 0) or 0),
                 "bookmarks": int(item.get("bookmarks", 0) or 0),
-                "views":     int(statistics.get("play_count", 0) or 0),
+                "views":     int(item.get("views", 0) or 0),
             }
     return stats_map
 
